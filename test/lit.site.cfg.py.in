@@ -1,0 +1,16 @@
+@LIT_SITE_CFG_IN_HEADER@
+
+import sys
+
+config.host_triple = "@LLVM_HOST_TRIPLE@"
+config.target_triple = "@TARGET_TRIPLE@"
+config.llvm_tools_dir = "@LLVM_TOOLS_DIR@"
+config.mlir_obj_root = "@MLIR_BINARY_DIR@"
+config.distilbert_obj_root = "@CMAKE_BINARY_DIR@"
+config.distilbert_tools_dir = "@CMAKE_BINARY_DIR@/bin"
+
+import lit.llvm
+lit.llvm.initialize(lit_config, config)
+
+# Let the main config do the real work.
+lit_config.load_config(config, "@CMAKE_CURRENT_SOURCE_DIR@/lit.cfg.py")
