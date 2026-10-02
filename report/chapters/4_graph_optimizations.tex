@@ -1,0 +1,76 @@
+\chapter{Graph-Level Optimizations}
+\label{ch:graph_optimizations}
+
+\section{The Imperative of Graph Analysis}
+When a model like DistilBERT is executed dynamically within a framework like PyTorch, the execution engine evaluates the mathematical graph sequentially, node by node. When it encounters a Matrix Multiplication, it dispatches an optimized kernel (e.g., from OpenBLAS or cuBLAS) to compute the result. The engine then allocates temporary memory to hold this intermediate result, writes the data to RAM, and proceeds to the next node (e.g., Softmax).
+
+This "eager execution" model is highly flexible for research and development, but it is catastrophically inefficient for production inference on edge devices. The overhead of repeatedly allocating memory and the latency of reading/writing intermediate tensors to DRAM completely dwarfs the actual time spent executing math. 
+
+To circumvent this, our MLIR compiler analyzes the entire computational graph statically before a single byte of machine code is generated. Operating on the high-level `dbert` dialect, the compiler has a macroscopic view of the network's topology, allowing it to perform profound structural rewrites.
+
+\section{Attention Fusion using Declarative Rewrite Rules (DRR)}
+The most glaring inefficiency in the Transformer architecture is the computation of the Self-Attention scores. As outlined in Chapter \ref{ch:background}, the equation $\text{softmax}(QK^T)V$ requires three discrete operations:
+\begin{enumerate}
+    \item $S = QK^T$ (A massive $O(N^3)$ Matrix Multiplication producing the Attention Scores).
+    \item $P = \text{softmax}(S)$ (An element-wise exponential and normalization across rows, producing the Attention Probabilities).
+    \item $O = PV$ (Another $O(N^3)$ Matrix Multiplication to compute the final weighted Values).
+\end{enumerate}
+
+If $N=128$, the intermediate tensors $S$ and $P$ each require 64KB of memory (in FP32). Writing $S$ to memory, reading $S$ to compute Softmax, writing $P$ to memory, and reading $P$ to compute $O$ results in four massive, completely unnecessary DRAM transactions per attention head, per layer.
+
+\subsection{Kernel Fusion}
+Kernel Fusion is the compiler optimization technique of merging multiple operations into a single execution loop. By fusing these three operations, the compiler can compute a fragment of $QK^T$, immediately apply the Softmax exponential to it while the data is still sitting inside the ultra-fast CPU registers (or L1 Cache), multiply it by the corresponding fragment of $V$, and accumulate the final result. The intermediate tensors $S$ and $P$ are never physically allocated in main memory.
+
+\subsection{Implementing Fusion via DRR}
+To accomplish this in MLIR, we must instruct the compiler to search the entire graph for instances of `MatMul -> Softmax -> MatMul` and replace them with a single, monolithic `dbert.mha` (Multi-Head Attention) operation.
+
+Instead of writing thousands of lines of fragile C++ code to manually walk the graph, check edge connections, and verify types, we utilize MLIR's Declarative Rewrite Rules (DRR). DRR allows compiler engineers to define graph transformations using TableGen (`.td` files). The TableGen compiler automatically generates the complex C++ pattern matching state machine.
+
+In `FusionPatterns.td`, we defined the transformation concisely:
+
+\begin{lstlisting}[language=C++]
+def FuseAttentionPattern : Pat<
+  (MatMulOp (SoftmaxOp (MatMulOp $query, $key)), $value),
+  (MHAOp $query, $key, $value)
+>;
+\end{lstlisting}
+
+This declarative syntax is extremely powerful. The `Pat` class takes a source pattern tree and a destination pattern tree. During compilation, the `applyPatternsAndFoldGreedily` driver traverses the IR. Whenever it identifies a subgraph matching the source topology, it surgically excises the three redundant operations and splices in the unified `MHAOp`, automatically preserving all upstream and downstream data dependencies (SSA def-use chains).
+
+\section{Post-Training Static Quantization (PTQ)}
+While Attention Fusion drastically reduces memory bandwidth, the heavy lifting of DistilBERT remains the raw arithmetic of matrix multiplication. Executing these operations in 32-bit floating-point (FP32) on the ARM Cortex-A72 is inefficient, as FP32 provides vastly more numerical precision than a neural network requires to infer sentiment or extract text boundaries.
+
+To optimize arithmetic density, we implemented an INT8 Quantization pass in `QuantizeINT8.cpp`. By translating the math from 32-bit continuous numbers to 8-bit discrete integers, we quadruple the data throughput of the memory bus and the SIMD computational units.
+
+\subsection{Dynamic vs. Static Quantization}
+There are two primary approaches to quantizing a model for inference:
+\begin{itemize}
+    \item \textbf{Dynamic Quantization:} The model weights are quantized ahead of time, but the activation tensors (the data flowing between layers) are kept in FP32. During inference, right before a Matrix Multiplication, the runtime calculates the min/max of the incoming activation tensor, computes a scale, and quantizes it on the fly. This avoids precision loss but incurs heavy CPU overhead during execution.
+    \item \textbf{Static Quantization (PTQ):} The model is passed through a "Calibration" phase before compilation. Representative input data is fed into the network, and the minimum and maximum floating-point values flowing through every single operation are recorded. These statistics are hardcoded into the compiler, allowing the runtime to use predetermined integer math without calculating scales on the fly.
+\end{itemize}
+
+Our compiler strictly enforces Post-Training Static Quantization for maximum bare-metal performance.
+
+\subsection{Calibration Attribute Parsing}
+The C++ compiler pass targets all `dbert.matmul` operations operating on FP32 tensors. It queries the operation for `calib_min` and `calib_max` floating-point attributes, which were injected into the MLIR by the frontend ingestion script after observing the calibration datasets.
+
+If the attributes are missing, the compiler applies conservative fallback heuristics, though true calibration is mandatory for maintaining language model accuracy.
+
+\subsection{Scale Derivation and Graph Mutation}
+Given the absolute maximum value $r_{max\_abs}$ from the calibration attributes, the compiler derives the Symmetric Quantization scale factor $S$ required to map that maximum value to $127$ (the maximum bound of an 8-bit signed integer):
+
+\begin{equation}
+S = \frac{\max(|calib\_min|, |calib\_max|)}{127.0}
+\end{equation}
+
+Once $S$ is mathematically derived, the compiler utilizes the `PatternRewriter` API to mutate the graph. It performs the following steps:
+\begin{enumerate}
+    \item Provisions new `tensor<...xi8>` data types for the left and right operands.
+    \item Injects a `dbert.quantize` operation on the left operand (e.g., the activations), passing $S$ as an attribute.
+    \item Injects a `dbert.quantize` operation on the right operand (e.g., the weights), passing $S$ as an attribute.
+    \item Generates a completely new `dbert.matmul` operation that accepts the `i8` operands.
+    \item Injects a `dbert.dequantize` operation that scales the resulting 32-bit accumulated integer (from the dot product) back into FP32 space using $S^2$, allowing subsequent, unquantized operations (like LayerNorm or GeLU) to proceed without precision collapse.
+    \item Safely deletes the original FP32 `MatMulOp` from the IR.
+\end{enumerate}
+
+This fully automated compiler pass transforms thousands of heavy floating-point operations into lightning-fast integer kernels without any manual intervention from the data scientist.

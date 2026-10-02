@@ -1,0 +1,59 @@
+\chapter{The \texttt{dbert} MLIR Dialect}
+\label{ch:mlir_dialect}
+
+\section{Design Rationale}
+To apply domain-specific optimizations such as fusing an entire Attention block, the compiler must first understand the semantics of the model. Standard LLVM IR represents programs as a flat list of assembly-like instructions (e.g., \texttt{fadd}, \texttt{load}), where the mathematical concept of a "Matrix Multiplication" is lost across thousands of nested loops.
+
+By defining an out-of-tree MLIR dialect named \texttt{dbert} (DistilBERT), we create a high-level representation that acts as a bridge between the PyTorch execution graph and the lower-level linear algebra compilers. The \texttt{dbert} dialect treats tensors as first-class citizens and represents complex neural network layers as single instructions.
+
+\section{Operation Definition via TableGen}
+MLIR leverages the LLVM TableGen infrastructure (\texttt{.td} files) to declaratively define dialects, operations, and compiler passes. This drastically reduces the boilerplate C++ required to register operations and generate parser/printer logic.
+
+Below is the TableGen definition for the core \texttt{MatMulOp} and \texttt{MHAOp} (Multi-Head Attention) in our dialect:
+
+\begin{lstlisting}[language=C++]
+def MatMulOp : DistilBERT_Op<"matmul", [Pure]> {
+  let summary = "General Matrix Multiplication";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$output);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($output)";
+}
+
+def MHAOp : DistilBERT_Op<"mha", [Pure]> {
+  let summary = "Multi-Head Attention operation";
+  let arguments = (ins AnyTensor:$query, AnyTensor:$key, AnyTensor:$value);
+  let results = (outs AnyTensor:$output);
+  let assemblyFormat = "$query `,` $key `,` $value attr-dict `:` type($query) `,` type($key) `,` type($value) `->` type($output)";
+  let hasVerifier = 1;
+}
+\end{lstlisting}
+
+\section{Type and Shape Verification}
+For the compiler to safely optimize the graph, it must guarantee that the incoming IR is grammatically and mathematically sound. We utilize MLIR's verification framework to enforce tensor shape and type constraints.
+
+Because we set \texttt{hasVerifier = 1} in the TableGen definition for \texttt{MHAOp}, we implement the C++ validation logic in \texttt{DistilBERTOps.cpp}. For instance, the attention mechanism requires that the Query and Key tensors possess the exact same elemental precision (e.g., both FP32 or both INT8):
+
+\begin{lstlisting}[language=C++]
+LogicalResult MHAOp::verify() {
+  auto qType = getQuery().getType().dyn_cast<TensorType>();
+  auto kType = getKey().getType().dyn_cast<TensorType>();
+  
+  if (qType && kType && qType.getElementType() != kType.getElementType()) {
+    return emitOpError("Query and Key must have the same element type");
+  }
+  return success();
+}
+\end{lstlisting}
+
+\section{Frontend Ingestion via PyTorch FX}
+To populate the compiler with real data, we implemented a Python frontend utilizing HuggingFace's \texttt{transformers.utils.fx.symbolic\_trace}. PyTorch FX traces the execution of the \texttt{DistilBertModel}, capturing a directed acyclic graph (DAG) of the mathematical operations. 
+
+Our importer script traverses this DAG, dynamically allocates Static Single Assignment (SSA) registers (e.g., \texttt{\%0}, \texttt{\%1}), and maps recognized PyTorch functions to our \texttt{dbert} dialect. A traced \texttt{torch.matmul} node is actively translated into a textual MLIR representation:
+
+\begin{lstlisting}[language=C++]
+%score = "dbert.matmul"(%query, %key) : (tensor<1x128x768xf32>, tensor<1x128x768xf32>) -> tensor<1x128x128xf32>
+\end{lstlisting}
+
+This MLIR file serves as the strict, strongly-typed entry point for all subsequent optimization passes in the compiler.
+
+

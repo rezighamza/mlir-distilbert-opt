@@ -1,0 +1,41 @@
+\chapter{Introduction}
+\label{ch:intro}
+
+\section{Context and Motivation}
+In recent years, Natural Language Processing (NLP) has experienced a paradigm shift driven by the advent of Transformer architectures \cite{vaswani2017attention}. Models such as BERT, GPT, and their derivatives have achieved state-of-the-art results across a multitude of language tasks, ranging from machine translation to sentiment analysis and question answering. However, this unprecedented accuracy comes at a staggering computational cost. The self-attention mechanism, a hallmark of the Transformer, scales quadratically with sequence length, requiring massive memory bandwidth and processing power.
+
+As AI applications increasingly move from cloud data centers to edge devices—such as smartphones, IoT sensors, and single-board computers like the Raspberry Pi—the computational demands of these models present a critical bottleneck. Edge devices are characterized by strict limitations on memory, thermal envelopes, and battery life. Deploying a standard, unoptimized PyTorch model on a Raspberry Pi 4 (which features a Broadcom BCM2711 quad-core Cortex-A72 processor) results in unacceptably high latency and rapid memory exhaustion.
+
+While model compression techniques like knowledge distillation (e.g., DistilBERT \cite{sanh2019distilbert}) successfully reduce the parameter count by 40\% while retaining 97\% of language understanding capabilities, the execution framework itself remains a limiting factor. Interpreted Python runtimes and generic deep learning frameworks are highly abstracted and often fail to exploit the specific micro-architectural features of the target hardware, such as the ARM NEON SIMD (Single Instruction, Multiple Data) registers and the highly constrained 32KB L1 Data Caches.
+
+\section{Problem Statement}
+To achieve real-time NLP inference on edge devices, relying solely on model compression is insufficient. The underlying compiler and execution runtime must be aggressively tailored to the hardware. The primary challenges addressed in this report are:
+\begin{enumerate}
+    \item \textbf{Abstraction Overhead:} Generic ML frameworks incur significant overhead due to dynamic dispatch and memory allocation during runtime.
+    \item \textbf{Suboptimal Graph Execution:} Subgraphs within the Transformer architecture, particularly the sequence of \texttt{MatMul} $\rightarrow$ \texttt{Softmax} $\rightarrow$ \texttt{MatMul} in the attention mechanism, are executed as separate kernels, leading to extreme memory fragmentation and redundant read/write cycles to main memory (DRAM).
+    \item \textbf{Precision Redundancy:} 32-bit floating-point arithmetic (FP32) provides unnecessary precision for inference tasks, wasting memory bandwidth and SIMD register capacity.
+    \item \textbf{Cache Thrashing:} Heavy $O(N^3)$ matrix multiplications cause severe cache thrashing on processors with small L1/L2 caches, stalling the CPU while waiting for RAM.
+\end{enumerate}
+
+\section{Proposed Solution}
+This report proposes an end-to-end, hardware-aware compiler pipeline built upon the Multi-Level Intermediate Representation (MLIR) framework \cite{lattner2020mlir} and the LLVM compiler infrastructure \cite{lattner2004llvm}. By bypassing standard runtimes entirely, we map the high-level PyTorch graph of a HuggingFace DistilBERT model directly into a custom MLIR dialect, apply domain-specific optimizations, and lower it to a native ARM executable shared object (\texttt{.so}).
+
+The specific contributions of this work include:
+\begin{itemize}
+    \item \textbf{The \texttt{dbert} Dialect:} An out-of-tree MLIR dialect designed to semantically represent high-level NLP operations.
+    \item \textbf{Graph-Level Rewrites:} Implementation of Declarative Rewrite Rules (DRR) to detect and fuse the attention mechanism, reducing memory transactions.
+    \item \textbf{Static INT8 Quantization:} A custom compiler pass that mathematically maps FP32 tensors to INT8, halving memory bandwidth requirements and enabling higher throughput on ARM NEON.
+    \item \textbf{Cache-Aware Tiling:} The application of Linalg transformations to tile large matrices into 32x32 blocks, ensuring data remains resident in the Cortex-A72's L1 cache.
+    \item \textbf{Vectorization and LLVM Emission:} Lowering the optimized dialect to the MLIR Vector dialect, mapping directly to 128-bit NEON registers, and translating the final IR into LLVM IR for bare-metal AArch64 object file emission.
+\end{itemize}
+
+\section{report Outline}
+The remainder of this report is structured as follows:
+Chapter \ref{ch:background} provides the theoretical background on Transformers, DistilBERT, the MLIR compiler framework, and ARM architecture. 
+Chapter \ref{ch:mlir_dialect} details the design and TableGen implementation of the custom \texttt{dbert} dialect. 
+Chapter \ref{ch:graph_optimizations} explores the high-level optimization passes, specifically Attention Fusion and Post-Training Static Quantization. 
+Chapter \ref{ch:lowering_and_codegen} describes the middle-end and backend lowering processes, covering Linalg tiling, vectorization, and LLVM CodeGen. 
+Chapter \ref{ch:evaluation} presents the benchmarking methodology and results on the Raspberry Pi 4 hardware. 
+Finally, Chapter \ref{ch:conclusion} concludes the report and outlines future directions for edge NLP compilation.
+
+

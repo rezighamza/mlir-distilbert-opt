@@ -1,0 +1,89 @@
+\chapter{Lowering and Code Generation}
+\label{ch:lowering_and_codegen}
+
+\section{The Philosophy of Progressive Lowering}
+One of the core tenants of the MLIR framework is "progressive lowering." Unlike monolithic compilers that attempt to optimize code in a single massive phase, MLIR steps down the ladder of abstraction gracefully. By the time the graph-level optimizations discussed in Chapter \ref{ch:graph_optimizations} are complete, the Intermediate Representation (IR) is still sitting at the \texttt{dbert} dialect level. The compiler now faces the challenge of translating these high-level semantic nodes into executable machine instructions.
+
+This translation is achieved by mapping the \texttt{dbert} dialect to the \texttt{linalg} (Linear Algebra) dialect, subsequently bufferizing the memory, vectorizing the loops for the ARM NEON architecture, and ultimately emitting a standalone shared object file via the LLVM backend.
+
+\section{Translating Domain Specifics to Linalg}
+The \texttt{linalg} dialect in MLIR is designed to represent linear algebra operations and loop nests in a highly analyzable, mathematically rigorous format. It heavily relies on "Structured Ops," which define computations using iterators (e.g., parallel, reduction, window) and affine maps that describe how multi-dimensional tensors are accessed.
+
+In our pass pipeline, implemented within \texttt{LowerToLinalg.cpp}, the custom \texttt{dbert.matmul} operation is intercepted by a Rewrite Pattern. 
+
+\subsection{Destination-Passing Style (DPS)}
+A fundamental shift occurs when transitioning from \texttt{dbert} to \texttt{linalg}. High-level frameworks like PyTorch treat tensors as pure mathematical values that simply "exist" and are returned by functions. However, physical hardware cannot return pure values; it must mutate allocated memory.
+
+Linalg bridges this gap using Destination-Passing Style (DPS). In DPS, operations do not return newly created tensors out of thin air. Instead, the compiler must explicitly provide an "output buffer" as an argument to the operation. The operation will then mutate this provided buffer.
+
+To facilitate this, our compiler generates a \texttt{tensor.empty} operation to declare the structural shape of the required output memory. Because matrix multiplications compute sums, this uninitialized memory must be zeroed out. The compiler inserts a \texttt{linalg.fill} operation to write $0.0$ to the empty tensor. Finally, the filled tensor is passed as the \texttt{outs} argument to the newly generated \texttt{linalg.matmul} operation.
+
+\section{Cache-Aware Loop Tiling}
+With the operations successfully lowered to \texttt{linalg}, the compiler now has visibility into the nested loops of the matrix multiplications. The standard algorithm for multiplying an $M \times K$ matrix by a $K \times N$ matrix requires three nested \texttt{for} loops, possessing $O(M \cdot K \cdot N)$ time complexity.
+
+\subsection{The Cache Thrashing Dilemma}
+As established in Chapter \ref{ch:background}, the Cortex-A72 features a 32KB L1 Data Cache. During a naive matrix multiplication, the innermost loop iterates across the entirety of the $K$ dimension. If the rows and columns being fetched exceed 32KB, the earliest data fetched will be evicted from the cache before the loop can reuse it. Consequently, the CPU is forced to stall for hundreds of clock cycles while fetching the evicted data back from the slow LPDDR4 main memory.
+
+\subsection{Linalg Tiling Implementation}
+To eradicate cache thrashing, we apply Loop Tiling (also known as Loop Blocking). Tiling restructures the 3-deep loop nest into a 6-deep loop nest. The outer three loops iterate over "blocks" or "tiles" of the matrices, while the inner three loops perform the dense matrix multiplication strictly within those tiles.
+
+Within \texttt{LowerToVector.cpp}, the compiler configures the MLIR Linalg transformation passes:
+
+\begin{lstlisting}[language=C++]
+linalg::LinalgTilingOptions tilingOptions;
+tilingOptions.setTileSizes({32, 32, 32});
+\end{lstlisting}
+
+By strictly confining the tile sizes to $32 \times 32$, we mathematically guarantee the memory footprint of the active computation. A $32 \times 32$ block of 32-bit floats consumes exactly 4 Kilobytes. The CPU needs to hold a block from Matrix A (4KB), a block from Matrix B (4KB), and a block for the Output Matrix C (4KB). This total active working set of 12KB sits comfortably within the 32KB L1 cache, allowing the processor to compute at maximum theoretical throughput without a single DRAM memory stall.
+
+\section{ARM NEON Vectorization and Bufferization}
+
+\subsection{Vectorization via SIMD}
+Once the loops are tiled into $32 \times 32$ chunks, the compiler applies \texttt{linalg::populateLinalgToVectorPatterns}. This powerful transformation analyzes the innermost loops and unrolls them into the MLIR \texttt{vector} dialect. 
+
+The \texttt{vector} dialect explicitly models hardware-agnostic SIMD registers. For our target architecture, these operations will eventually map to the 128-bit wide NEON registers on the ARM Cortex-A72. Instead of computing one floating-point multiplication per clock cycle, the vector instructions command the Arithmetic Logic Unit (ALU) to process four 32-bit floats simultaneously, or an astonishing sixteen 8-bit integers if the model was quantized by our earlier PTQ passes.
+
+\subsection{Bufferization: From Math to Memory}
+Up to this point, the entire IR has relied on the `tensor` dialect. Tensors in MLIR are mathematically pure; they adhere to Value Semantics. Modifying a single element of a tensor conceptually yields an entirely new tensor. 
+
+Hardware processors do not understand Value Semantics; they understand memory addresses, pointers, and mutable state (Reference Semantics). The transition from Tensors to Memory is known as Bufferization. 
+
+Our pipeline invokes comprehensive Bufferization passes. The compiler performs complex alias analysis to determine when a memory buffer can be safely overwritten (mutated in place) versus when a new memory allocation (\texttt{malloc}) must be injected to prevent corrupting data still required by other operations. The `tensor` dialect is completely stripped away, replaced by the \texttt{memref} (Memory Reference) dialect, which explicitly models pointers, strides, and memory layouts.
+
+\section{LLVM IR Translation and Object Emission}
+The ultimate phase of our compilation architecture is backend generation. The MLIR representation, now consisting of low-level \texttt{memref}, \texttt{vector}, and \texttt{scf} (Structured Control Flow) dialects, is translated into the \texttt{llvm} dialect via \texttt{LowerToLLVM.cpp}.
+
+\subsection{The LLVM Translation Interface}
+The \texttt{llvm} dialect in MLIR maintains a strict 1:1 parity with standard LLVM IR. All multidimensional \texttt{memref} objects are lowered into raw LLVM struct types containing base pointers and offset arrays. All \texttt{vector} operations are lowered into native LLVM SIMD intrinsics.
+
+Instead of passing textual LLVM IR to external command-line compilers like \texttt{clang} or \texttt{llc}, we engineered a custom, standalone C++ compiler driver named \texttt{distilbert-translate}.
+
+\subsection{TargetMachine API and Bare-Metal CodeGen}
+\texttt{distilbert-translate} utilizes the programmatic LLVM \texttt{TargetMachine} API to cross-compile the IR directly into machine code. 
+
+\begin{lstlisting}[language=C++]
+auto targetTriple = llvm::sys::getDefaultTargetTriple(); 
+// Explicit targeting for Raspberry Pi 4:
+// auto targetTriple = "aarch64-linux-gnu";
+
+std::string error;
+auto target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
+llvm::TargetOptions opt;
+auto RM = llvm::Optional<llvm::Reloc::Model>();
+auto targetMachine = target->createTargetMachine(targetTriple, "generic", "", opt, RM);
+
+llvmModule->setDataLayout(targetMachine->createDataLayout());
+llvmModule->setTargetTriple(targetTriple);
+
+std::error_code EC;
+llvm::raw_fd_ostream dest(outputFilename, EC, llvm::sys::fs::OF_None);
+auto FileType = llvm::CGFT_ObjectFile;
+targetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType);
+pass.run(*llvmModule);
+\end{lstlisting}
+
+This driver invokes LLVM's Instruction Selection (ISel) and Register Allocation algorithms to generate optimized AArch64 assembly. The final output is physically streamed out to the filesystem as a Linux shared object file (\texttt{.so}). 
+
+By compiling the Neural Network directly into a bare-metal library, we completely eradicate the necessity for Python, PyTorch, or any heavy Deep Learning runtime on the edge device. The Raspberry Pi only needs to load the `.so` file into memory and execute the pure, highly-optimized C++ functions, achieving unprecedented low-latency inference.
+
+

@@ -1,0 +1,19 @@
+\chapter{Conclusion}
+\label{ch:conclusion}
+
+\section{Summary of Contributions}
+This report successfully conceptualized, designed, and implemented a completely customized, end-to-end MLIR compilation pipeline dedicated to the deployment of the DistilBERT NLP model on resource-constrained Edge environments. 
+
+By analyzing the specific bottlenecks of the Transformer architecture and the hardware limitations of the Raspberry Pi 4's ARM Cortex-A72 processor, a series of aggressive compilation strategies were deployed. The creation of the \texttt{dbert} dialect allowed for high-level semantic analysis, paving the way for Attention Fusion and mathematical Post-Training Static INT8 Quantization. Subsequently, mid-level Linalg transformations applied cache-aware loop tiling to maintain high L1 cache coherency, followed by hardware-specific Vectorization targeting 128-bit NEON registers. The pipeline concluded by emitting a bare-metal shared object file via the LLVM backend, completely circumventing heavy deep learning runtimes.
+
+\section{Future Work}
+While the current compiler provides robust performance optimizations, several avenues for future research and enhancement remain:
+\begin{enumerate}
+    \item \textbf{Dynamic Shapes:} The current implementation relies on strictly typed static shapes. Extending the \texttt{dbert} dialect and the LLVM lowering passes to support dynamic sequence lengths and batch sizes would drastically increase the flexibility of the emitted object files.
+    \item \textbf{Asymmetric Quantization:} Implementing asymmetric quantization with Zero-point calculations would provide better accuracy for Non-Linear activation functions (like GeLU), which are rarely symmetric around zero.
+    \item \textbf{NPU Targeting:} Future iterations of Edge hardware frequently include Neural Processing Units (NPUs). Developing an MLIR backend translation layer from the \texttt{dbert} dialect to generic NPU APIs (like Android NNAPI or Google Edge TPU) would offload computation from the CPU entirely.
+\end{enumerate}
+
+The integration of compiler technologies like MLIR into the Deep Learning ecosystem is vital. As models continue to grow exponentially in parameter size, the path to ubiquitous AI relies not just on algorithmic efficiency, but on the ruthless, hardware-aware optimization of the compiler stack.
+
+

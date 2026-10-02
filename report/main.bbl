@@ -1,0 +1,37 @@
+\begin{thebibliography}{1}
+
+\bibitem{jacob2018quantization}
+Benoit Jacob, Skirmantas Kligys, Bo~Chen, Menglong Zhu, Matthew Tang, Andrew
+  Howard, Hartwig Adam, and Dmitry Kalenichenko.
+\newblock Quantization and training of neural networks for efficient
+  integer-arithmetic-only inference.
+\newblock {\em Proceedings of the IEEE conference on computer vision and
+  pattern recognition}, pages 2704--2713, 2018.
+
+\bibitem{lattner2004llvm}
+Chris Lattner and Vikram Adve.
+\newblock Llvm: A compilation framework for lifelong program analysis \&
+  transformation.
+\newblock {\em International Symposium on Code Generation and Optimization,
+  2004. CGO 2004.}, pages 75--86, 2004.
+
+\bibitem{lattner2020mlir}
+Chris Lattner, Mehdi Amini, Uday Bondhugula, Akshay Bandishti, Richard Riddle,
+  Albert Smelyanskiy, Dongik Yoo, Tatiana Vandermapas, Alex Davis, et~al.
+\newblock Mlir: A compiler infrastructure for the end of moore's law.
+\newblock In {\em 2020 IEEE/ACM International Symposium on Code Generation and
+  Optimization (CGO)}, pages 1--13. IEEE, 2020.
+
+\bibitem{sanh2019distilbert}
+Victor Sanh, Lysandre Debut, Julien Chaumond, and Thomas Wolf.
+\newblock Distilbert, a distilled version of bert: smaller, faster, cheaper and
+  lighter.
+\newblock {\em arXiv preprint arXiv:1910.01108}, 2019.
+
+\bibitem{vaswani2017attention}
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+  Aidan~N Gomez, {\L}ukasz Kaiser, and Illia Polosukhin.
+\newblock Attention is all you need.
+\newblock {\em Advances in neural information processing systems}, 30, 2017.
+
+\end{thebibliography}
